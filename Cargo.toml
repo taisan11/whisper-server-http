@@ -1,0 +1,23 @@
+[package]
+name = "whisper-server-http"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.8", features = ["multipart"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net","sync", "signal"] }
+whisper-rs = "0.15.1"
+nojson = "0.3"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.11"
+tower = "0.5"
+hound = "3.5"
+ort = "2.0.0-rc.11"
+ndarray = "0.16"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version="0.15.1",features = ["metal"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+whisper-rs = { version="0.15.1",features = ["cuda"] }
