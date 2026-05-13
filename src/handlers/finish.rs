@@ -1,3 +1,4 @@
+use super::validate_filename;
 use crate::models::ErrorResponse;
 use crate::services::TranscriptionService;
 use axum::{
@@ -13,7 +14,25 @@ pub async fn finish_handler(
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let filename = match query.get("filename") {
-        Some(f) => f.clone(),
+        Some(f) => match validate_filename(f) {
+            Ok(valid) => valid,
+            Err(e) => {
+                let json = nojson::json(|f| {
+                    f.set_spacing(true);
+                    f.set_indent_size(2);
+                    f.value(&ErrorResponse {
+                        error: format!("Invalid 'filename' query parameter: {}", e),
+                    })
+                });
+
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    json.to_string(),
+                )
+                    .into_response();
+            }
+        },
         None => {
             let json = nojson::json(|f| {
                 f.set_spacing(true);

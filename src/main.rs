@@ -2,24 +2,35 @@ mod handlers;
 mod models;
 mod services;
 
-use axum::{Router, routing::get, routing::post};
+use axum::{Router, extract::DefaultBodyLimit, routing::get, routing::post};
 use services::{TranscriptionService, VadService};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-use whisper_rs::{WhisperContext, WhisperContextParameters};
+use whisper_rs::{WhisperContext, WhisperContextParameters, install_logging_hooks};
 
 #[tokio::main]
 async fn main() {
+    // Load .env file if present so std::env::var can read those values.
+    let dotenv_loaded = dotenvy::dotenv().is_ok();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,whisper_rs=off,whisper_rs_sys=off,whisper_server_http::services::transcription=warn,whisper_server_http::services::vad=warn".into()
+            }),
         )
         .init();
 
+    // Suppress whisper.cpp / ggml default stderr logs unless explicitly configured.
+    install_logging_hooks();
+
     info!("起動中...");
+    if !dotenv_loaded {
+        info!(".env が見つからなかったので、システム環境変数のみを使用します");
+    }
 
     // Get port from environment variable or use default
     let port = std::env::var("PORT")
@@ -77,7 +88,14 @@ async fn main() {
 
     // Create data directory
     let data_dir = PathBuf::from("data");
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        tracing::error!(
+            "データディレクトリを作成できなかったよ '{}': {}",
+            data_dir.display(),
+            e
+        );
+        std::process::exit(1);
+    }
 
     // Initialize transcription service
     let mut service = TranscriptionService::new(ctx, data_dir);
@@ -93,7 +111,10 @@ async fn main() {
     // Build router
     let app = Router::new()
         .route("/", get(health_check))
-        .route("/upload", post(handlers::upload_handler))
+        .route(
+            "/upload",
+            post(handlers::upload_handler).layer(DefaultBodyLimit::disable()),
+        )
         .route("/status", get(handlers::status_handler))
         .route("/finish", get(handlers::finish_handler))
         .layer(CorsLayer::permissive())
@@ -125,9 +146,10 @@ async fn main() {
     info!("  RUST_LOG           - ログレベル");
     info!("================================");
 
-    axum::serve(listener, app)
-        .await
-        .expect("Server failed to start");
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("サーバー実行中にエラーが発生したよ: {}", e);
+        std::process::exit(1);
+    }
 }
 
 async fn health_check() -> &'static str {

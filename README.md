@@ -61,6 +61,17 @@ Silero VADモデルファイルのパスを指定します。
   VAD_MODEL_PATH="./models/silero_vad.onnx"
   ```
 
+### MAX_AUDIO_SAMPLES
+
+`/upload` で受け付ける音声の最大サンプル数（16kHz換算）を指定します。  
+未設定時は従来どおり `28800000`（約30分）です。
+
+- **デフォルト値**: `28800000`
+- **設定例**:
+  ```env
+  MAX_AUDIO_SAMPLES=57600000
+  ```
+
 ## VAD（Voice Activity Detection）について
 
 ここではSilero VADを使用して、音声の無音部分を自動的に検出・除去します。

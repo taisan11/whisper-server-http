@@ -1,3 +1,4 @@
+use super::validate_filename;
 use crate::models::ErrorResponse;
 use crate::services::TranscriptionService;
 use axum::{
@@ -6,8 +7,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use std::sync::Arc;
-use tracing::{error, info};
+use std::sync::{Arc, OnceLock};
+use tracing::{error, info, warn};
+
+const DEFAULT_MAX_AUDIO_SAMPLES: usize = 16000 * 60 * 30; // 30 minutes at 16kHz
+const MAX_AUDIO_SAMPLES_ENV: &str = "MAX_AUDIO_SAMPLES";
+const MIN_SAMPLE_RATE: u32 = 8000;
+const MAX_SAMPLE_RATE: u32 = 192000;
 
 pub async fn upload_handler(
     State(service): State<Arc<TranscriptionService>>,
@@ -20,7 +26,7 @@ pub async fn upload_handler(
     let mut filename: Option<String> = None;
 
     // Parse multipart form data
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         let name = field.name().map(|s| s.to_string()).unwrap_or_default();
 
         match name.as_str() {
@@ -30,18 +36,25 @@ pub async fn upload_handler(
                     filename = Some(fname.to_string());
                 }
 
-                let data: Bytes = match field.bytes().await {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        error!("Failed to read audio data: {}", e);
-                        return json_response(
-                            StatusCode::BAD_REQUEST,
-                            &ErrorResponse {
-                                error: format!("Failed to read audio data: {}", e),
-                            },
-                        );
+                let mut audio_bytes = Vec::new();
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) => {
+                            audio_bytes.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("Failed to read audio data: {}", e);
+                            return json_response(
+                                StatusCode::BAD_REQUEST,
+                                &ErrorResponse {
+                                    error: format!("Failed to read audio data: {}", e),
+                                },
+                            );
+                        }
                     }
-                };
+                }
+                let data = Bytes::from(audio_bytes);
 
                 // Try to parse as WAV file first
                 if let Ok(wav_data) = parse_wav(&data) {
@@ -54,7 +67,30 @@ pub async fn upload_handler(
             }
             "sample_rate" => {
                 if let Ok(text) = field.text().await {
-                    sample_rate = text.parse::<u32>().unwrap_or(16000);
+                    match text.parse::<u32>() {
+                        Ok(rate) if (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate) => {
+                            sample_rate = rate;
+                        }
+                        Ok(_) => {
+                            return json_response(
+                                StatusCode::BAD_REQUEST,
+                                &ErrorResponse {
+                                    error: format!(
+                                        "sample_rate must be between {} and {}",
+                                        MIN_SAMPLE_RATE, MAX_SAMPLE_RATE
+                                    ),
+                                },
+                            );
+                        }
+                        Err(_) => {
+                            return json_response(
+                                StatusCode::BAD_REQUEST,
+                                &ErrorResponse {
+                                    error: "sample_rate must be a valid integer".to_string(),
+                                },
+                            );
+                        }
+                    }
                 }
             }
             "filename" => {
@@ -77,17 +113,36 @@ pub async fn upload_handler(
             );
         }
     };
+    if audio_data.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse {
+                error: "Audio data is empty".to_string(),
+            },
+        );
+    }
 
     // Generate filename if not provided
-    let filename = filename.unwrap_or_else(|| {
+    let filename_raw = filename.unwrap_or_else(|| {
         format!(
             "audio_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
         )
     });
+    let filename = match validate_filename(&filename_raw) {
+        Ok(valid) => valid,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("Invalid filename: {}", e),
+                },
+            );
+        }
+    };
 
     info!(
         "Processing upload: filename={}, samples={}, sample_rate={}Hz",
@@ -102,6 +157,26 @@ pub async fn upload_handler(
     } else {
         audio_data
     };
+    if audio_data.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse {
+                error: "Audio data is empty after preprocessing".to_string(),
+            },
+        );
+    }
+    let max_audio_samples = max_audio_samples();
+    if audio_data.len() > max_audio_samples {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &ErrorResponse {
+                error: format!(
+                    "Audio is too long (max {} samples at 16kHz)",
+                    max_audio_samples
+                ),
+            },
+        );
+    }
 
     // Save audio file to disk
     let audio_path = std::path::PathBuf::from("data").join(format!("{}.wav", filename));
@@ -162,6 +237,31 @@ fn json_response<T: nojson::DisplayJson>(status: StatusCode, data: &T) -> Respon
         .into_response()
 }
 
+fn max_audio_samples() -> usize {
+    static MAX_AUDIO_SAMPLES: OnceLock<usize> = OnceLock::new();
+
+    *MAX_AUDIO_SAMPLES.get_or_init(|| match std::env::var(MAX_AUDIO_SAMPLES_ENV) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            Ok(_) => {
+                warn!(
+                    "{} must be greater than 0. Using default: {}",
+                    MAX_AUDIO_SAMPLES_ENV, DEFAULT_MAX_AUDIO_SAMPLES
+                );
+                DEFAULT_MAX_AUDIO_SAMPLES
+            }
+            Err(_) => {
+                warn!(
+                    "Invalid {}='{}'. Using default: {}",
+                    MAX_AUDIO_SAMPLES_ENV, raw, DEFAULT_MAX_AUDIO_SAMPLES
+                );
+                DEFAULT_MAX_AUDIO_SAMPLES
+            }
+        },
+        Err(_) => DEFAULT_MAX_AUDIO_SAMPLES,
+    })
+}
+
 fn parse_wav(data: &[u8]) -> Result<(Vec<f32>, u32), String> {
     let cursor = std::io::Cursor::new(data);
     let reader =
@@ -198,8 +298,11 @@ fn parse_raw_pcm(data: &[u8]) -> Vec<f32> {
 }
 
 fn resample(data: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
+    if data.is_empty() || from_rate == to_rate {
         return data.to_vec();
+    }
+    if from_rate == 0 || to_rate == 0 {
+        return Vec::new();
     }
 
     let ratio = from_rate as f64 / to_rate as f64;
@@ -220,8 +323,10 @@ fn resample(data: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 }
 
 fn save_audio_as_wav(audio_data: &[f32], path: &std::path::PathBuf) -> Result<(), String> {
-    std::fs::create_dir_all(path.parent().unwrap())
-        .map_err(|e| format!("Failed to create directory: {}", e))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Invalid output path".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
 
     let spec = hound::WavSpec {
         channels: 1,
